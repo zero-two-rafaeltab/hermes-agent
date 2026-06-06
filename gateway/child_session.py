@@ -38,4 +38,7 @@ class GatewayChildSessionResult:
     session_id: Optional[str]
     dispatched: bool
     idempotent_replay: bool = False
+    announcement_channel_id: Optional[str] = None
+    announcement_message_id: Optional[str] = None
+    announcement_url: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)

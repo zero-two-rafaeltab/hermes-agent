@@ -23,13 +23,25 @@ class FakeSessionStore:
 
 
 class FakeAdapter:
-    def __init__(self, *, thread_id: str | None = "thread-999", allowed=True, create_delay: float = 0):
+    def __init__(
+        self,
+        *,
+        thread_id: str | None = "thread-999",
+        allowed=True,
+        create_delay: float = 0,
+        announce: bool = False,
+    ):
         self.created = []
         self.events = []
         self.thread_id = thread_id
         self.allowed = allowed
         self.create_delay = create_delay
         self.marked_threads = []
+        self.announce = announce
+        self.announcements = []
+        self.child_backlinks = []
+        if not announce:
+            self.__dict__["announce_child_session"] = None
 
     def is_child_session_parent_allowed(self, source):
         return self.allowed
@@ -45,6 +57,33 @@ class FakeAdapter:
         if thread_id:
             self.marked_threads.append(str(thread_id))
         return thread_id
+
+    async def announce_child_session(self, *, parent_source, parent_channel_id, thread_name, metadata=None):
+        if self.create_delay:
+            await asyncio.sleep(self.create_delay)
+        self.created.append((parent_channel_id, thread_name))
+        if not self.thread_id:
+            return None
+        announcement_channel_id = (
+            parent_source.chat_id if parent_source.chat_type == "thread" else parent_channel_id
+        )
+        message_id = f"ann-{len(self.announcements) + 1}"
+        announcement = {
+            "child_channel_id": self.thread_id,
+            "thread_id": self.thread_id,
+            "announcement_channel_id": announcement_channel_id,
+            "announcement_message_id": message_id,
+            "announcement_url": (
+                f"https://discord.com/channels/{parent_source.guild_id}/"
+                f"{announcement_channel_id}/{message_id}"
+            ),
+            "text": f"Started child session {thread_name}: <#{self.thread_id}>",
+            "anchored_to_announcement": parent_source.chat_type != "thread",
+        }
+        self.announcements.append(announcement)
+        self.child_backlinks.append(parent_source.chat_id)
+        self.marked_threads.append(str(self.thread_id))
+        return announcement
 
     async def handle_message(self, event):
         self.events.append(event)
@@ -183,6 +222,72 @@ async def test_start_child_session_creates_discord_thread_under_parent_channel_f
         group_sessions_per_user=True,
         thread_sessions_per_user=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_start_child_session_announces_normal_channel_child_with_metadata():
+    adapter = FakeAdapter(announce=True)
+    runner = make_runner(adapter=adapter)
+    req = GatewayChildSessionRequest(
+        parent_event=parent_event(),
+        child_title="Issue child",
+        starter_prompt="Begin child run",
+        idempotency_key="issue-15-normal",
+        metadata={"issue_number": 15, "attempt": 2, "plugin": "tests"},
+    )
+
+    first = await runner.start_child_session(req)
+    replay = await runner.start_child_session(req)
+
+    assert adapter.created == [("chan-123", "Issue child")]
+    assert len(adapter.announcements) == 1
+    announcement = adapter.announcements[0]
+    assert announcement["announcement_channel_id"] == "chan-123"
+    assert announcement["anchored_to_announcement"] is True
+    assert "<#thread-999>" in announcement["text"]
+    assert adapter.child_backlinks == ["chan-123"]
+    assert first.announcement_channel_id == "chan-123"
+    assert first.announcement_message_id == "ann-1"
+    assert first.announcement_url == "https://discord.com/channels/guild-1/chan-123/ann-1"
+    assert first.metadata["announcement_channel_id"] == "chan-123"
+    assert first.metadata["announcement_message_id"] == "ann-1"
+    assert first.metadata["announcement_url"] == first.announcement_url
+    assert replay.idempotent_replay is True
+    assert replay.announcement_message_id == "ann-1"
+    assert len(adapter.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_start_child_session_announces_existing_thread_sibling_with_backlink():
+    adapter = FakeAdapter(announce=True)
+    runner = make_runner(adapter=adapter)
+    req = GatewayChildSessionRequest(
+        parent_event=parent_event(
+            chat_type="thread",
+            chat_id="control-thread",
+            parent_chat_id="chan-parent",
+            thread_id="control-thread",
+        ),
+        child_title="Sibling child",
+        starter_prompt="Begin sibling child",
+        metadata={"plugin": "tests"},
+    )
+
+    result = await runner.start_child_session(req)
+
+    assert adapter.created == [("chan-parent", "Sibling child")]
+    assert len(adapter.announcements) == 1
+    announcement = adapter.announcements[0]
+    assert announcement["announcement_channel_id"] == "control-thread"
+    assert announcement["anchored_to_announcement"] is False
+    assert "<#thread-999>" in announcement["text"]
+    assert adapter.child_backlinks == ["control-thread"]
+    assert result.parent_channel_id == "chan-parent"
+    assert result.child_channel_id == "thread-999"
+    assert result.announcement_channel_id == "control-thread"
+    assert result.announcement_message_id == "ann-1"
+    assert result.announcement_url == "https://discord.com/channels/guild-1/control-thread/ann-1"
+    assert result.metadata["announcement_url"] == result.announcement_url
 
 
 @pytest.mark.asyncio

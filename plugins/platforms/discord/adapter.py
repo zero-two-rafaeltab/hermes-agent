@@ -4119,6 +4119,200 @@ class DiscordAdapter(BasePlatformAdapter):
             self._threads.mark(str(thread_id))
         return thread_id
 
+    def _discord_message_url(
+        self,
+        *,
+        guild_id: Optional[str],
+        channel_id: Optional[str],
+        message_id: Optional[str],
+    ) -> Optional[str]:
+        """Build a stable Discord message URL when all public identifiers exist."""
+        if not guild_id or not channel_id or not message_id:
+            return None
+        return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+
+    def _child_session_announcement_text(
+        self,
+        thread_name: str,
+        *,
+        thread_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Compose the visible control message for a plugin-started child session."""
+        details: list[str] = []
+        meta = metadata or {}
+        issue = meta.get("issue_number") or meta.get("issue")
+        attempt = meta.get("attempt") or meta.get("attempt_number")
+        plugin = meta.get("plugin")
+        if issue:
+            details.append(f"issue {issue}")
+        if attempt:
+            details.append(f"attempt {attempt}")
+        if plugin:
+            details.append(f"plugin {plugin}")
+        suffix = f" ({', '.join(details)})" if details else ""
+        if thread_id:
+            return f"🧵 Started child session **{thread_name}**{suffix}: <#{thread_id}>"
+        return f"🧵 Starting child session **{thread_name}**{suffix}…"
+
+    async def _resolve_discord_channel(self, channel_id: str) -> Optional[Any]:
+        """Resolve a Discord channel/thread by id from cache or REST."""
+        if not self._client:
+            return None
+        try:
+            numeric_id = int(channel_id)
+        except (TypeError, ValueError):
+            return None
+        channel = self._client.get_channel(numeric_id)
+        if channel is not None:
+            return channel
+        try:
+            return await self._client.fetch_channel(numeric_id)
+        except Exception:
+            return None
+
+    async def announce_child_session(
+        self,
+        *,
+        parent_source: Any,
+        parent_channel_id: str,
+        thread_name: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Optional[str]]]:
+        """Create a Discord child thread plus visible announcement metadata.
+
+        Normal channel invocations are anchored to the announcement message by
+        creating the child thread from that message when Discord supports it.
+        Existing thread invocations create a sibling under the parent channel
+        and post the visible link back in the invoking/control thread.
+        """
+        if not self._client or not DISCORD_AVAILABLE:
+            return None
+
+        metadata = metadata or {}
+        thread_name = (thread_name or "Hermes child session").strip()[:80] or "Hermes child session"
+        invoking_is_thread = getattr(parent_source, "chat_type", None) == "thread"
+        announcement_channel_id: Optional[str] = None
+        announcement_message_id: Optional[str] = None
+        announcement_url: Optional[str] = None
+
+        parent = await self._resolve_discord_channel(parent_channel_id)
+        if parent is None or isinstance(parent, getattr(discord, "DMChannel", ())):
+            return None
+
+        thread = None
+        reason = "Hermes plugin child session"
+
+        if invoking_is_thread:
+            create = getattr(parent, "create_thread", None)
+            if create is not None:
+                create_kwargs: Dict[str, Any] = {
+                    "name": thread_name,
+                    "auto_archive_duration": 1440,
+                    "reason": reason,
+                }
+                if self._is_forum_parent(parent):
+                    create_kwargs["content"] = self._child_session_announcement_text(thread_name, metadata=metadata)
+                created = await create(**create_kwargs)
+                thread = created if hasattr(created, "send") else getattr(created, "thread", created)
+            else:
+                seed = await parent.send(self._child_session_announcement_text(thread_name, metadata=metadata))
+                thread = await seed.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=1440,
+                    reason=reason,
+                )
+
+            thread_id = str(getattr(thread, "id"))
+            invoking_id = str(getattr(parent_source, "thread_id", None) or getattr(parent_source, "chat_id", ""))
+            invoking = await self._resolve_discord_channel(invoking_id)
+            if invoking is not None and hasattr(invoking, "send"):
+                msg = await invoking.send(
+                    self._child_session_announcement_text(thread_name, thread_id=thread_id, metadata=metadata)
+                )
+                announcement_channel_id = invoking_id
+                announcement_message_id = str(getattr(msg, "id", "")) or None
+                announcement_url = getattr(msg, "jump_url", None) or self._discord_message_url(
+                    guild_id=str(getattr(parent_source, "guild_id", "") or "") or None,
+                    channel_id=announcement_channel_id,
+                    message_id=announcement_message_id,
+                )
+        elif self._is_forum_parent(parent):
+            created = await parent.create_thread(
+                name=thread_name,
+                content=self._child_session_announcement_text(thread_name, metadata=metadata),
+            )
+            thread = created if hasattr(created, "send") else getattr(created, "thread", created)
+            starter = getattr(created, "message", None)
+            thread_id = str(getattr(thread, "id"))
+            announcement_channel_id = str(parent_channel_id)
+            announcement_message_id = str(getattr(starter, "id", "")) or None
+            announcement_url = getattr(starter, "jump_url", None) or self._discord_message_url(
+                guild_id=str(getattr(parent_source, "guild_id", "") or "") or None,
+                channel_id=announcement_channel_id,
+                message_id=announcement_message_id,
+            )
+            edit = getattr(starter, "edit", None)
+            if edit is not None:
+                try:
+                    await edit(content=self._child_session_announcement_text(thread_name, thread_id=thread_id, metadata=metadata))
+                except Exception:
+                    logger.debug("[%s] Could not edit child-session forum announcement", self.name, exc_info=True)
+        else:
+            seed = await parent.send(self._child_session_announcement_text(thread_name, metadata=metadata))
+            announcement_channel_id = str(parent_channel_id)
+            announcement_message_id = str(getattr(seed, "id", "")) or None
+            announcement_url = getattr(seed, "jump_url", None) or self._discord_message_url(
+                guild_id=str(getattr(parent_source, "guild_id", "") or "") or None,
+                channel_id=announcement_channel_id,
+                message_id=announcement_message_id,
+            )
+            try:
+                thread = await seed.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=1440,
+                    reason=reason,
+                )
+            except Exception:
+                create = getattr(parent, "create_thread", None)
+                if create is None:
+                    raise
+                thread = await create(
+                    name=thread_name,
+                    auto_archive_duration=1440,
+                    reason=reason,
+                )
+            thread_id = str(getattr(thread, "id"))
+            edit = getattr(seed, "edit", None)
+            if edit is not None:
+                try:
+                    await edit(content=self._child_session_announcement_text(thread_name, thread_id=thread_id, metadata=metadata))
+                except Exception:
+                    logger.debug("[%s] Could not edit child-session announcement", self.name, exc_info=True)
+
+        thread_id = str(getattr(thread, "id")) if thread is not None else None
+        if not thread_id:
+            return None
+
+        if getattr(self, "_threads", None) is not None:
+            self._threads.mark(thread_id)
+
+        back_channel_id = str(getattr(parent_source, "thread_id", None) or getattr(parent_source, "chat_id", ""))
+        send_to_child = getattr(thread, "send", None)
+        if back_channel_id and send_to_child is not None:
+            try:
+                await send_to_child(f"↩️ Parent/control context: <#{back_channel_id}>")
+            except Exception:
+                logger.debug("[%s] Could not send child-session back-link", self.name, exc_info=True)
+
+        return {
+            "child_channel_id": thread_id,
+            "thread_id": thread_id,
+            "announcement_channel_id": announcement_channel_id,
+            "announcement_message_id": announcement_message_id,
+            "announcement_url": announcement_url,
+        }
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
