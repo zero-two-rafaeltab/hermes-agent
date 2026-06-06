@@ -1131,6 +1131,7 @@ from gateway.session import (
     is_shared_multi_user_session,
 )
 from gateway.delivery import DeliveryRouter
+from gateway.child_session import GatewayChildSessionRequest, GatewayChildSessionResult
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -1883,6 +1884,12 @@ class GatewayRunner:
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
+
+        # Public child-session seam idempotency. Keyed by plugin-provided
+        # attempt keys scoped to the parent platform/channel/user so gateway
+        # retries do not duplicate child threads or initial turns.
+        self._child_session_results: Dict[str, GatewayChildSessionResult] = {}
+        self._child_session_lock = asyncio.Lock()
 
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
@@ -4763,6 +4770,174 @@ class GatewayRunner:
             except Exception as exc:
                 logger.debug("Handoff watcher tick error: %s", exc, exc_info=True)
             await asyncio.sleep(interval)
+
+    def _child_session_idempotency_scope(self, request: GatewayChildSessionRequest) -> str:
+        """Build a stable retry scope for a child-session attempt key."""
+        source = getattr(getattr(request, "parent_event", None), "source", None)
+        platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+        parts = [
+            str(platform or "unknown"),
+            str(getattr(source, "guild_id", "") or ""),
+            str(getattr(source, "parent_chat_id", "") or getattr(source, "chat_id", "") or ""),
+            str(getattr(source, "thread_id", "") or ""),
+            str(getattr(source, "user_id", "") or ""),
+            str(request.idempotency_key or ""),
+        ]
+        return "\x1f".join(parts)
+
+    def _resolve_child_parent_channel_id(self, source: SessionSource) -> str:
+        """Return the channel under which a child destination should be made."""
+        if source.platform == Platform.DISCORD and source.chat_type == "thread":
+            parent = (source.parent_chat_id or "").strip()
+            if parent:
+                return parent
+        return str(source.parent_chat_id or source.chat_id or "")
+
+    async def start_child_session(
+        self,
+        request: GatewayChildSessionRequest,
+    ) -> GatewayChildSessionResult:
+        """Create and start a normal gateway-origin child session.
+
+        This is the public seam for gateway plugins that need to fan out work
+        into a platform-native child destination. The child turn is dispatched
+        through the adapter's normal ``handle_message`` path, preserving the
+        active-session guard, slash command semantics, live streaming via
+        ``GatewayStreamConsumer``, and subsequent ``/status`` / ``/stop`` in the
+        child thread.
+        """
+        if not isinstance(request, GatewayChildSessionRequest):
+            raise TypeError("request must be a GatewayChildSessionRequest")
+        parent_event = request.parent_event
+        parent_source = getattr(parent_event, "source", None)
+        if parent_source is None or parent_source.platform is None:
+            raise ValueError("parent_event.source is required")
+        if not (request.child_title or "").strip():
+            raise ValueError("child_title is required")
+        if not (request.starter_prompt or "").strip():
+            raise ValueError("starter_prompt is required")
+
+        # Reuse the same gateway authorization decision as the normal cold path.
+        # Do not honor MessageEvent.internal here: this API is callable by
+        # plugins, so the parent sender/channel must be authorized on its own.
+        if not self._is_user_authorized(parent_source):
+            raise PermissionError("parent gateway event is not authorized")
+
+        adapter = self.adapters.get(parent_source.platform)
+        if adapter is None:
+            raise RuntimeError(
+                f"platform '{parent_source.platform.value}' is not active in this gateway"
+            )
+
+        lock = getattr(self, "_child_session_lock", None)
+        if lock is None:
+            lock = self._child_session_lock = asyncio.Lock()
+        results = getattr(self, "_child_session_results", None)
+        if results is None:
+            results = self._child_session_results = {}
+
+        idem_scope = None
+        if request.idempotency_key:
+            idem_scope = self._child_session_idempotency_scope(request)
+            async with lock:
+                previous = results.get(idem_scope)
+                if previous is not None:
+                    return dataclasses.replace(
+                        previous,
+                        scheduled_started=False,
+                        idempotent_replay=True,
+                    )
+
+        platform_name = parent_source.platform.value
+        parent_channel_id = self._resolve_child_parent_channel_id(parent_source)
+        if not parent_channel_id:
+            raise ValueError("parent_event.source.chat_id is required")
+
+        thread_name = (request.child_title or "Hermes child session").strip()[:80]
+        thread_name = thread_name or "Hermes child session"
+        metadata = dict(request.metadata or {})
+        metadata.setdefault("parent_message_id", getattr(parent_event, "message_id", None))
+        metadata.setdefault("parent_user_id", parent_source.user_id)
+
+        new_thread_id: Optional[str] = None
+        try:
+            create_thread = getattr(adapter, "create_handoff_thread", None)
+            if create_thread is not None:
+                new_thread_id = await create_thread(parent_channel_id, thread_name)
+        except Exception as exc:
+            logger.debug(
+                "Child session: create_handoff_thread failed on %s/%s: %s",
+                platform_name,
+                parent_channel_id,
+                exc,
+                exc_info=True,
+            )
+            new_thread_id = None
+
+        child_channel_id = str(new_thread_id or parent_channel_id)
+        child_thread_id = str(new_thread_id) if new_thread_id else None
+        child_chat_type = "thread" if new_thread_id else parent_source.chat_type
+
+        # Match Discord's natural adapter source shape for later messages in the
+        # created thread: chat_id == thread id, thread_id == thread id, and
+        # parent_chat_id points back to the containing text channel. This keeps
+        # /status, /stop, and subsequent user turns on the same session key.
+        child_source = SessionSource(
+            platform=parent_source.platform,
+            chat_id=child_channel_id,
+            chat_name=thread_name,
+            chat_type=child_chat_type,
+            user_id=parent_source.user_id,
+            user_name=parent_source.user_name,
+            thread_id=child_thread_id,
+            chat_topic=parent_source.chat_topic,
+            user_id_alt=parent_source.user_id_alt,
+            guild_id=parent_source.guild_id,
+            parent_chat_id=parent_channel_id if child_thread_id else parent_source.parent_chat_id,
+            message_id=getattr(parent_event, "message_id", None),
+        )
+
+        platform_cfg = self.config.platforms.get(parent_source.platform)
+        extra = platform_cfg.extra if platform_cfg else {}
+        session_key = build_session_key(
+            child_source,
+            group_sessions_per_user=extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+        )
+        entry = self.session_store.get_or_create_session(child_source)
+        session_id = getattr(entry, "session_id", None)
+
+        child_event = MessageEvent(
+            text=request.starter_prompt,
+            message_type=MessageType.TEXT,
+            source=child_source,
+            raw_message=getattr(parent_event, "raw_message", None),
+            internal=False,
+        )
+
+        await adapter.handle_message(child_event)
+
+        result = GatewayChildSessionResult(
+            platform=platform_name,
+            parent_channel_id=str(parent_channel_id),
+            child_channel_id=child_channel_id,
+            thread_name=thread_name,
+            session_key=session_key,
+            session_id=session_id,
+            scheduled_started=True,
+            idempotent_replay=False,
+            metadata=metadata,
+        )
+        if idem_scope:
+            async with lock:
+                existing = results.setdefault(idem_scope, result)
+                if existing is not result:
+                    return dataclasses.replace(
+                        existing,
+                        scheduled_started=False,
+                        idempotent_replay=True,
+                    )
+        return result
 
     async def _process_handoff(self, row: Dict[str, Any]) -> None:
         """Execute one handoff row. Raises on failure (caller marks failed)."""

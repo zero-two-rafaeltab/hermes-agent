@@ -17,6 +17,7 @@ from .session import (
     build_session_context_prompt,
 )
 from .delivery import DeliveryRouter, DeliveryTarget
+from .child_session import GatewayChildSessionRequest, GatewayChildSessionResult
 
 __all__ = [
     # Config
@@ -32,4 +33,7 @@ __all__ = [
     # Delivery
     "DeliveryRouter",
     "DeliveryTarget",
+    # Child session seam
+    "GatewayChildSessionRequest",
+    "GatewayChildSessionResult",
 ]
