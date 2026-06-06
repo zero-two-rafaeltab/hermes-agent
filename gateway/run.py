@@ -1980,6 +1980,7 @@ class GatewayRunner:
         # attempt keys scoped to the parent platform/channel/user so gateway
         # retries do not duplicate child threads or initial turns.
         self._child_session_results: Dict[str, GatewayChildSessionResult] = {}
+        self._child_session_inflight: Dict[str, asyncio.Future] = {}
         self._child_session_lock = asyncio.Lock()
 
         # Track platforms that failed to connect for background reconnection.
@@ -4947,7 +4948,13 @@ class GatewayRunner:
         if results is None:
             results = self._child_session_results = {}
 
+        inflight = getattr(self, "_child_session_inflight", None)
+        if inflight is None:
+            inflight = self._child_session_inflight = {}
+
         idem_scope = None
+        owner_future: Optional[asyncio.Future] = None
+        replay_future: Optional[asyncio.Future] = None
         if request.idempotency_key:
             idem_scope = self._child_session_idempotency_scope(request)
             async with lock:
@@ -4955,10 +4962,57 @@ class GatewayRunner:
                 if previous is not None:
                     return dataclasses.replace(
                         previous,
-                        scheduled_started=False,
+                        dispatched=False,
                         idempotent_replay=True,
                     )
+                existing_future = inflight.get(idem_scope)
+                if existing_future is None:
+                    owner_future = asyncio.get_running_loop().create_future()
+                    inflight[idem_scope] = owner_future
+                else:
+                    replay_future = existing_future
+            if replay_future is not None:
+                replay = await replay_future
+                return dataclasses.replace(
+                    replay,
+                    dispatched=False,
+                    idempotent_replay=True,
+                )
 
+        try:
+            result = await self._start_child_session_once(request, parent_source, adapter)
+        except Exception as exc:
+            if idem_scope and owner_future is not None:
+                async with lock:
+                    if not owner_future.done():
+                        owner_future.add_done_callback(
+                            lambda fut: None if fut.cancelled() else fut.exception()
+                        )
+                        owner_future.set_exception(exc)
+                    inflight.pop(idem_scope, None)
+            raise
+
+        if idem_scope and owner_future is not None:
+            async with lock:
+                results[idem_scope] = result
+                if not owner_future.done():
+                    owner_future.set_result(result)
+                inflight.pop(idem_scope, None)
+        return result
+
+    async def _start_child_session_once(
+        self,
+        request: GatewayChildSessionRequest,
+        parent_source: SessionSource,
+        adapter: Any,
+    ) -> GatewayChildSessionResult:
+        """Run child-session side effects exactly once for an idempotency scope."""
+
+        adapter_allowed = getattr(adapter, "is_child_session_parent_allowed", None)
+        if callable(adapter_allowed) and not adapter_allowed(parent_source):
+            raise PermissionError("parent gateway event is blocked by adapter channel policy")
+
+        parent_event = request.parent_event
         platform_name = parent_source.platform.value
         parent_channel_id = self._resolve_child_parent_channel_id(parent_source)
         if not parent_channel_id:
@@ -4972,18 +5026,25 @@ class GatewayRunner:
 
         new_thread_id: Optional[str] = None
         try:
-            create_thread = getattr(adapter, "create_handoff_thread", None)
+            create_thread = getattr(adapter, "create_child_session_thread", None)
+            if create_thread is None:
+                create_thread = getattr(adapter, "create_handoff_thread", None)
             if create_thread is not None:
                 new_thread_id = await create_thread(parent_channel_id, thread_name)
         except Exception as exc:
             logger.debug(
-                "Child session: create_handoff_thread failed on %s/%s: %s",
+                "Child session: create thread failed on %s/%s: %s",
                 platform_name,
                 parent_channel_id,
                 exc,
                 exc_info=True,
             )
+            if parent_source.platform == Platform.DISCORD:
+                raise RuntimeError("failed to create Discord child session thread") from exc
             new_thread_id = None
+
+        if parent_source.platform == Platform.DISCORD and not new_thread_id:
+            raise RuntimeError("failed to create Discord child session thread")
 
         child_channel_id = str(new_thread_id or parent_channel_id)
         child_thread_id = str(new_thread_id) if new_thread_id else None
@@ -5028,27 +5089,17 @@ class GatewayRunner:
 
         await adapter.handle_message(child_event)
 
-        result = GatewayChildSessionResult(
+        return GatewayChildSessionResult(
             platform=platform_name,
             parent_channel_id=str(parent_channel_id),
             child_channel_id=child_channel_id,
             thread_name=thread_name,
             session_key=session_key,
             session_id=session_id,
-            scheduled_started=True,
+            dispatched=True,
             idempotent_replay=False,
             metadata=metadata,
         )
-        if idem_scope:
-            async with lock:
-                existing = results.setdefault(idem_scope, result)
-                if existing is not result:
-                    return dataclasses.replace(
-                        existing,
-                        scheduled_started=False,
-                        idempotent_replay=True,
-                    )
-        return result
 
     async def _process_handoff(self, row: Dict[str, Any]) -> None:
         """Execute one handoff row. Raises on failure (caller marks failed)."""

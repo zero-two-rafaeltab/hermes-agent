@@ -1,5 +1,4 @@
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 
@@ -24,25 +23,40 @@ class FakeSessionStore:
 
 
 class FakeAdapter:
-    def __init__(self):
+    def __init__(self, *, thread_id: str | None = "thread-999", allowed=True, create_delay: float = 0):
         self.created = []
         self.events = []
+        self.thread_id = thread_id
+        self.allowed = allowed
+        self.create_delay = create_delay
+        self.marked_threads = []
+
+    def is_child_session_parent_allowed(self, source):
+        return self.allowed
 
     async def create_handoff_thread(self, parent_chat_id, name):
+        if self.create_delay:
+            await asyncio.sleep(self.create_delay)
         self.created.append((parent_chat_id, name))
-        return "thread-999"
+        return self.thread_id
+
+    async def create_child_session_thread(self, parent_chat_id, name):
+        thread_id = await self.create_handoff_thread(parent_chat_id, name)
+        if thread_id:
+            self.marked_threads.append(str(thread_id))
+        return thread_id
 
     async def handle_message(self, event):
         self.events.append(event)
 
 
-def make_runner(*, authorized=True):
+def make_runner(*, authorized=True, adapter=None):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, extra={})}
     )
     runner.session_store = FakeSessionStore()
-    runner.adapters = {Platform.DISCORD: FakeAdapter()}
+    runner.adapters = {Platform.DISCORD: adapter or FakeAdapter()}
     runner._child_session_results = {}
     runner._child_session_lock = asyncio.Lock()
     runner._is_user_authorized = lambda source: authorized
@@ -68,6 +82,45 @@ def parent_event(*, chat_type="group", chat_id="chan-123", parent_chat_id=None, 
         source=source,
         message_id="msg-1",
     )
+
+
+def test_discord_child_session_parent_policy_reuses_channel_gates():
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    adapter = object.__new__(DiscordAdapter)
+    adapter.config = PlatformConfig(
+        enabled=True,
+        extra={"allowed_channels": ["allowed-parent", "ignored"], "ignored_channels": ["ignored"]},
+    )
+
+    assert adapter.is_child_session_parent_allowed(
+        parent_event(chat_id="thread", parent_chat_id="allowed-parent", thread_id="thread").source
+    )
+    assert not adapter.is_child_session_parent_allowed(parent_event(chat_id="other").source)
+    assert not adapter.is_child_session_parent_allowed(parent_event(chat_id="ignored").source)
+
+
+@pytest.mark.asyncio
+async def test_discord_create_child_session_thread_marks_participation():
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    class Threads:
+        def __init__(self):
+            self.marked = []
+
+        def mark(self, thread_id):
+            self.marked.append(thread_id)
+
+    adapter = object.__new__(DiscordAdapter)
+    adapter._threads = Threads()
+
+    async def fake_create(parent_chat_id, name):
+        return "child-thread-1"
+
+    adapter.create_handoff_thread = fake_create
+
+    assert await adapter.create_child_session_thread("parent", "Child") == "child-thread-1"
+    assert adapter._threads.marked == ["child-thread-1"]
 
 
 @pytest.mark.asyncio
@@ -120,8 +173,9 @@ async def test_start_child_session_creates_discord_thread_under_parent_channel_f
     assert result.child_channel_id == "thread-999"
     assert result.thread_name == "Child from existing thread"
     assert result.session_id == "sess-child"
-    assert result.scheduled_started is True
+    assert result.dispatched is True
     assert result.idempotent_replay is False
+    assert adapter.marked_threads == ["thread-999"]
     assert result.metadata["plugin"] == "test-harness"
     assert result.metadata["parent_message_id"] == "msg-1"
     assert result.session_key == build_session_key(
@@ -147,12 +201,70 @@ async def test_start_child_session_idempotency_replays_without_duplicate_dispatc
     adapter = runner.adapters[Platform.DISCORD]
     assert adapter.created == [("chan-123", "Idempotent child")]
     assert len(adapter.events) == 1
-    assert first.scheduled_started is True
+    assert first.dispatched is True
     assert first.idempotent_replay is False
     assert second.child_channel_id == first.child_channel_id
     assert second.session_key == first.session_key
-    assert second.scheduled_started is False
+    assert second.dispatched is False
     assert second.idempotent_replay is True
+
+
+@pytest.mark.asyncio
+async def test_start_child_session_concurrent_idempotency_only_dispatches_once():
+    adapter = FakeAdapter(create_delay=0.05)
+    runner = make_runner(adapter=adapter)
+    req = GatewayChildSessionRequest(
+        parent_event=parent_event(),
+        child_title="Concurrent child",
+        starter_prompt="Run once despite concurrency",
+        idempotency_key="attempt-concurrent",
+    )
+
+    first, second = await asyncio.gather(
+        runner.start_child_session(req),
+        runner.start_child_session(req),
+    )
+
+    assert adapter.created == [("chan-123", "Concurrent child")]
+    assert len(adapter.events) == 1
+    assert adapter.marked_threads == ["thread-999"]
+    assert {first.dispatched, second.dispatched} == {True, False}
+    assert {first.idempotent_replay, second.idempotent_replay} == {False, True}
+    assert first.child_channel_id == second.child_channel_id == "thread-999"
+
+
+@pytest.mark.asyncio
+async def test_start_child_session_discord_thread_failure_does_not_dispatch_to_parent():
+    adapter = FakeAdapter(thread_id=None)
+    runner = make_runner(adapter=adapter)
+    req = GatewayChildSessionRequest(
+        parent_event=parent_event(),
+        child_title="No thread",
+        starter_prompt="Do not leak to parent",
+    )
+
+    with pytest.raises(RuntimeError, match="Discord child session thread"):
+        await runner.start_child_session(req)
+
+    assert adapter.created == [("chan-123", "No thread")]
+    assert adapter.events == []
+
+
+@pytest.mark.asyncio
+async def test_start_child_session_enforces_adapter_channel_policy_before_create():
+    adapter = FakeAdapter(allowed=False)
+    runner = make_runner(adapter=adapter)
+    req = GatewayChildSessionRequest(
+        parent_event=parent_event(),
+        child_title="Blocked child",
+        starter_prompt="Do not dispatch",
+    )
+
+    with pytest.raises(PermissionError, match="adapter channel policy"):
+        await runner.start_child_session(req)
+
+    assert adapter.created == []
+    assert adapter.events == []
 
 
 @pytest.mark.asyncio

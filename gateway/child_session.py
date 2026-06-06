@@ -36,6 +36,6 @@ class GatewayChildSessionResult:
     thread_name: str
     session_key: Optional[str]
     session_id: Optional[str]
-    scheduled_started: bool
+    dispatched: bool
     idempotent_replay: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)

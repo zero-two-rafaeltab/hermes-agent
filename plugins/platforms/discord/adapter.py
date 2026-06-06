@@ -3907,6 +3907,54 @@ class DiscordAdapter(BasePlatformAdapter):
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
 
+    def _discord_channel_id_set(self, config_key: str, env_key: str) -> set:
+        """Return normalized Discord channel IDs from config or env."""
+        raw = self.config.extra.get(config_key)
+        if raw is None:
+            raw = os.getenv(env_key, "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        s = str(raw).strip() if raw is not None else ""
+        if s:
+            return {part.strip() for part in s.split(",") if part.strip()}
+        return set()
+
+    def is_child_session_parent_allowed(self, source: Any) -> bool:
+        """Return whether a gateway-origin child session may start here.
+
+        ``start_child_session()`` receives a synthetic parent event from a
+        plugin instead of Discord's real ``on_message`` path, so reuse the
+        adapter's channel allow/ignore gates before the gateway creates a child
+        thread or dispatches the starter turn.
+        """
+        chat_type = str(getattr(source, "chat_type", "") or "").lower()
+        if chat_type in {"private", "dm", "direct"}:
+            return True
+
+        channel_ids = {
+            str(value).strip()
+            for value in (
+                getattr(source, "chat_id", None),
+                getattr(source, "parent_chat_id", None),
+                getattr(source, "thread_id", None),
+            )
+            if value is not None and str(value).strip()
+        }
+
+        allowed_channels = self._discord_channel_id_set(
+            "allowed_channels", "DISCORD_ALLOWED_CHANNELS"
+        )
+        if allowed_channels and "*" not in allowed_channels and not (channel_ids & allowed_channels):
+            return False
+
+        ignored_channels = self._discord_channel_id_set(
+            "ignored_channels", "DISCORD_IGNORED_CHANNELS"
+        )
+        if "*" in ignored_channels or bool(channel_ids & ignored_channels):
+            return False
+
+        return True
+
     def _discord_thread_require_mention(self) -> bool:
         """Return whether thread participation requires @mention to follow up.
 
@@ -4269,6 +4317,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 self.name, parent_chat_id, fallback_error,
             )
             return None
+
+    async def create_child_session_thread(
+        self,
+        parent_chat_id: str,
+        name: str,
+    ) -> Optional[str]:
+        """Create/register a Discord child-session thread for gateway plugins."""
+        thread_id = await self.create_handoff_thread(parent_chat_id, name)
+        if thread_id and getattr(self, "_threads", None) is not None:
+            self._threads.mark(str(thread_id))
+        return thread_id
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
