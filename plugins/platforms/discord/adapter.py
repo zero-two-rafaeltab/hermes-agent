@@ -3907,6 +3907,54 @@ class DiscordAdapter(BasePlatformAdapter):
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
 
+    def _discord_channel_id_set(self, config_key: str, env_key: str) -> set:
+        """Return normalized Discord channel IDs from config or env."""
+        raw = self.config.extra.get(config_key)
+        if raw is None:
+            raw = os.getenv(env_key, "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        s = str(raw).strip() if raw is not None else ""
+        if s:
+            return {part.strip() for part in s.split(",") if part.strip()}
+        return set()
+
+    def is_child_session_parent_allowed(self, source: Any) -> bool:
+        """Return whether a gateway-origin child session may start here.
+
+        ``start_child_session()`` receives a synthetic parent event from a
+        plugin instead of Discord's real ``on_message`` path, so reuse the
+        adapter's channel allow/ignore gates before the gateway creates a child
+        thread or dispatches the starter turn.
+        """
+        chat_type = str(getattr(source, "chat_type", "") or "").lower()
+        if chat_type in {"private", "dm", "direct"}:
+            return True
+
+        channel_ids = {
+            str(value).strip()
+            for value in (
+                getattr(source, "chat_id", None),
+                getattr(source, "parent_chat_id", None),
+                getattr(source, "thread_id", None),
+            )
+            if value is not None and str(value).strip()
+        }
+
+        allowed_channels = self._discord_channel_id_set(
+            "allowed_channels", "DISCORD_ALLOWED_CHANNELS"
+        )
+        if allowed_channels and "*" not in allowed_channels and not (channel_ids & allowed_channels):
+            return False
+
+        ignored_channels = self._discord_channel_id_set(
+            "ignored_channels", "DISCORD_IGNORED_CHANNELS"
+        )
+        if "*" in ignored_channels or bool(channel_ids & ignored_channels):
+            return False
+
+        return True
+
     def _discord_thread_require_mention(self) -> bool:
         """Return whether thread participation requires @mention to follow up.
 
@@ -4269,6 +4317,338 @@ class DiscordAdapter(BasePlatformAdapter):
                 self.name, parent_chat_id, fallback_error,
             )
             return None
+
+    async def create_child_session_thread(
+        self,
+        parent_chat_id: str,
+        name: str,
+    ) -> Optional[str]:
+        """Create/register a Discord child-session thread for gateway plugins."""
+        thread_id = await self.create_handoff_thread(parent_chat_id, name)
+        if thread_id and getattr(self, "_threads", None) is not None:
+            self._threads.mark(str(thread_id))
+        return thread_id
+
+    def _discord_message_url(
+        self,
+        *,
+        guild_id: Optional[str],
+        channel_id: Optional[str],
+        message_id: Optional[str],
+    ) -> Optional[str]:
+        """Build a stable Discord message URL when all public identifiers exist."""
+        if not guild_id or not channel_id or not message_id:
+            return None
+        return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+
+    def _child_session_announcement_text(
+        self,
+        thread_name: str,
+        *,
+        thread_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Compose the visible control message for a plugin-started child session."""
+        details: list[str] = []
+        meta = metadata or {}
+        issue = meta.get("issue_number") or meta.get("issue")
+        attempt = meta.get("attempt") or meta.get("attempt_number")
+        plugin = meta.get("plugin")
+        if issue:
+            details.append(f"issue {issue}")
+        if attempt:
+            details.append(f"attempt {attempt}")
+        if plugin:
+            details.append(f"plugin {plugin}")
+        suffix = f" ({', '.join(details)})" if details else ""
+        if thread_id:
+            return f"🧵 Started child session **{thread_name}**{suffix}: <#{thread_id}>"
+        return f"🧵 Starting child session **{thread_name}**{suffix}…"
+
+    def _child_session_allowed_mentions(self) -> Optional[Any]:
+        """Disable pings for plugin-controlled child-session notices."""
+        if not DISCORD_AVAILABLE or discord is None:
+            return None
+        try:
+            return discord.AllowedMentions.none()
+        except Exception:
+            return None
+
+    async def _send_child_session_notice(self, channel: Any, content: str) -> Any:
+        """Send a child-session notice without allowing mention expansion."""
+        send = getattr(channel, "send", None)
+        if send is None:
+            raise RuntimeError("Discord child session announcement target is not sendable")
+        kwargs: Dict[str, Any] = {}
+        allowed_mentions = self._child_session_allowed_mentions()
+        if allowed_mentions is not None:
+            kwargs["allowed_mentions"] = allowed_mentions
+        return await send(content, **kwargs)
+
+    async def _edit_child_session_notice(self, message: Any, content: str) -> None:
+        """Edit a child-session notice without allowing mention expansion."""
+        edit = getattr(message, "edit", None)
+        if edit is None:
+            raise RuntimeError("Discord child session announcement message is not editable")
+        kwargs: Dict[str, Any] = {"content": content}
+        allowed_mentions = self._child_session_allowed_mentions()
+        if allowed_mentions is not None:
+            kwargs["allowed_mentions"] = allowed_mentions
+        await edit(**kwargs)
+
+    def _child_session_message_metadata(
+        self,
+        *,
+        parent_source: Any,
+        channel_id: str,
+        message: Any,
+    ) -> tuple[str, Optional[str], Optional[str]]:
+        """Return announcement channel/message/url metadata for a Discord message."""
+        message_id = str(getattr(message, "id", "")) or None
+        url = getattr(message, "jump_url", None) or self._discord_message_url(
+            guild_id=str(getattr(parent_source, "guild_id", "") or "") or None,
+            channel_id=channel_id,
+            message_id=message_id,
+        )
+        return channel_id, message_id, url
+
+    async def _send_child_session_link_fallback(
+        self,
+        *,
+        target: Any,
+        target_channel_id: str,
+        parent_source: Any,
+        thread_name: str,
+        thread_id: str,
+        metadata: Dict[str, Any],
+    ) -> tuple[str, Optional[str], Optional[str]]:
+        """Send the final clickable child link after seed/starter edit failure."""
+        msg = await self._send_child_session_notice(
+            target,
+            self._child_session_announcement_text(thread_name, thread_id=thread_id, metadata=metadata),
+        )
+        return self._child_session_message_metadata(
+            parent_source=parent_source,
+            channel_id=target_channel_id,
+            message=msg,
+        )
+
+    async def _resolve_discord_channel(self, channel_id: str) -> Optional[Any]:
+        """Resolve a Discord channel/thread by id from cache or REST."""
+        if not self._client:
+            return None
+        try:
+            numeric_id = int(channel_id)
+        except (TypeError, ValueError):
+            return None
+        channel = self._client.get_channel(numeric_id)
+        if channel is not None:
+            return channel
+        try:
+            return await self._client.fetch_channel(numeric_id)
+        except Exception:
+            return None
+
+    async def announce_child_session(
+        self,
+        *,
+        parent_source: Any,
+        parent_channel_id: str,
+        thread_name: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Optional[str]]]:
+        """Create a Discord child thread plus visible announcement metadata.
+
+        Normal channel invocations are anchored to the announcement message by
+        creating the child thread from that message when Discord supports it.
+        Existing thread invocations create a sibling under the parent channel
+        and post the visible link back in the invoking/control thread.
+        """
+        if not self._client or not DISCORD_AVAILABLE:
+            return None
+
+        metadata = metadata or {}
+        thread_name = (thread_name or "Hermes child session").strip()[:80] or "Hermes child session"
+        invoking_is_thread = getattr(parent_source, "chat_type", None) == "thread"
+        announcement_channel_id: Optional[str] = None
+        announcement_message_id: Optional[str] = None
+        announcement_url: Optional[str] = None
+
+        parent = await self._resolve_discord_channel(parent_channel_id)
+        if parent is None or isinstance(parent, getattr(discord, "DMChannel", ())):
+            return None
+
+        thread = None
+        reason = "Hermes plugin child session"
+
+        if invoking_is_thread:
+            create = getattr(parent, "create_thread", None)
+            if create is not None:
+                create_kwargs: Dict[str, Any] = {
+                    "name": thread_name,
+                    "auto_archive_duration": 1440,
+                    "reason": reason,
+                }
+                if self._is_forum_parent(parent):
+                    create_kwargs["content"] = self._child_session_announcement_text(thread_name, metadata=metadata)
+                    allowed_mentions = self._child_session_allowed_mentions()
+                    if allowed_mentions is not None:
+                        create_kwargs["allowed_mentions"] = allowed_mentions
+                created = await create(**create_kwargs)
+                thread = created if hasattr(created, "send") else getattr(created, "thread", created)
+            else:
+                seed = await self._send_child_session_notice(
+                    parent,
+                    self._child_session_announcement_text(thread_name, metadata=metadata),
+                )
+                thread = await seed.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=1440,
+                    reason=reason,
+                )
+
+            thread_id = str(getattr(thread, "id"))
+            invoking_id = str(getattr(parent_source, "thread_id", None) or getattr(parent_source, "chat_id", ""))
+            invoking = await self._resolve_discord_channel(invoking_id)
+            if invoking is None or not hasattr(invoking, "send"):
+                raise RuntimeError(
+                    "Discord child session announcement failed: invoking thread could not be resolved or is not sendable"
+                )
+            try:
+                msg = await self._send_child_session_notice(
+                    invoking,
+                    self._child_session_announcement_text(thread_name, thread_id=thread_id, metadata=metadata),
+                )
+            except Exception as exc:
+                raise RuntimeError("Discord child session announcement failed in invoking thread") from exc
+            (
+                announcement_channel_id,
+                announcement_message_id,
+                announcement_url,
+            ) = self._child_session_message_metadata(
+                parent_source=parent_source,
+                channel_id=invoking_id,
+                message=msg,
+            )
+        elif self._is_forum_parent(parent):
+            create_kwargs: Dict[str, Any] = {
+                "name": thread_name,
+                "content": self._child_session_announcement_text(thread_name, metadata=metadata),
+            }
+            allowed_mentions = self._child_session_allowed_mentions()
+            if allowed_mentions is not None:
+                create_kwargs["allowed_mentions"] = allowed_mentions
+            created = await parent.create_thread(**create_kwargs)
+            thread = created if hasattr(created, "send") else getattr(created, "thread", created)
+            starter = getattr(created, "message", None)
+            thread_id = str(getattr(thread, "id"))
+            if starter is not None:
+                (
+                    announcement_channel_id,
+                    announcement_message_id,
+                    announcement_url,
+                ) = self._child_session_message_metadata(
+                    parent_source=parent_source,
+                    channel_id=str(parent_channel_id),
+                    message=starter,
+                )
+            try:
+                await self._edit_child_session_notice(
+                    starter,
+                    self._child_session_announcement_text(thread_name, thread_id=thread_id, metadata=metadata),
+                )
+            except Exception as exc:
+                logger.debug("[%s] Could not edit child-session forum announcement", self.name, exc_info=True)
+                try:
+                    (
+                        announcement_channel_id,
+                        announcement_message_id,
+                        announcement_url,
+                    ) = await self._send_child_session_link_fallback(
+                        target=thread,
+                        target_channel_id=thread_id,
+                        parent_source=parent_source,
+                        thread_name=thread_name,
+                        thread_id=thread_id,
+                        metadata=metadata,
+                    )
+                except Exception as fallback_exc:
+                    raise RuntimeError("Discord child session announcement failed after starter edit failure") from fallback_exc
+        else:
+            seed = await self._send_child_session_notice(
+                parent,
+                self._child_session_announcement_text(thread_name, metadata=metadata),
+            )
+            (
+                announcement_channel_id,
+                announcement_message_id,
+                announcement_url,
+            ) = self._child_session_message_metadata(
+                parent_source=parent_source,
+                channel_id=str(parent_channel_id),
+                message=seed,
+            )
+            try:
+                thread = await seed.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=1440,
+                    reason=reason,
+                )
+            except Exception:
+                create = getattr(parent, "create_thread", None)
+                if create is None:
+                    raise
+                thread = await create(
+                    name=thread_name,
+                    auto_archive_duration=1440,
+                    reason=reason,
+                )
+            thread_id = str(getattr(thread, "id"))
+            try:
+                await self._edit_child_session_notice(
+                    seed,
+                    self._child_session_announcement_text(thread_name, thread_id=thread_id, metadata=metadata),
+                )
+            except Exception as exc:
+                logger.debug("[%s] Could not edit child-session announcement", self.name, exc_info=True)
+                try:
+                    (
+                        announcement_channel_id,
+                        announcement_message_id,
+                        announcement_url,
+                    ) = await self._send_child_session_link_fallback(
+                        target=parent,
+                        target_channel_id=str(parent_channel_id),
+                        parent_source=parent_source,
+                        thread_name=thread_name,
+                        thread_id=thread_id,
+                        metadata=metadata,
+                    )
+                except Exception as fallback_exc:
+                    raise RuntimeError("Discord child session announcement failed after seed edit failure") from fallback_exc
+
+        thread_id = str(getattr(thread, "id")) if thread is not None else None
+        if not thread_id:
+            return None
+
+        if getattr(self, "_threads", None) is not None:
+            self._threads.mark(thread_id)
+
+        back_channel_id = str(getattr(parent_source, "thread_id", None) or getattr(parent_source, "chat_id", ""))
+        send_to_child = getattr(thread, "send", None)
+        if back_channel_id and send_to_child is not None:
+            try:
+                await self._send_child_session_notice(thread, f"↩️ Parent/control context: <#{back_channel_id}>")
+            except Exception:
+                logger.debug("[%s] Could not send child-session back-link", self.name, exc_info=True)
+
+        return {
+            "child_channel_id": thread_id,
+            "thread_id": thread_id,
+            "announcement_channel_id": announcement_channel_id,
+            "announcement_message_id": announcement_message_id,
+            "announcement_url": announcement_url,
+        }
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
