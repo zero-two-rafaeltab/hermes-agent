@@ -4914,12 +4914,30 @@ class GatewayRunner:
         metadata.setdefault("parent_user_id", parent_source.user_id)
 
         new_thread_id: Optional[str] = None
+        announcement_channel_id: Optional[str] = None
+        announcement_message_id: Optional[str] = None
+        announcement_url: Optional[str] = None
         try:
-            create_thread = getattr(adapter, "create_child_session_thread", None)
-            if create_thread is None:
-                create_thread = getattr(adapter, "create_handoff_thread", None)
-            if create_thread is not None:
-                new_thread_id = await create_thread(parent_channel_id, thread_name)
+            announce_child = getattr(adapter, "announce_child_session", None)
+            if parent_source.platform == Platform.DISCORD and callable(announce_child):
+                announcement = await announce_child(
+                    parent_source=parent_source,
+                    parent_channel_id=parent_channel_id,
+                    thread_name=thread_name,
+                    metadata=metadata,
+                )
+                if not announcement:
+                    raise RuntimeError("failed to announce Discord child session")
+                new_thread_id = announcement.get("child_channel_id") or announcement.get("thread_id")
+                announcement_channel_id = announcement.get("announcement_channel_id")
+                announcement_message_id = announcement.get("announcement_message_id")
+                announcement_url = announcement.get("announcement_url")
+            else:
+                create_thread = getattr(adapter, "create_child_session_thread", None)
+                if create_thread is None:
+                    create_thread = getattr(adapter, "create_handoff_thread", None)
+                if create_thread is not None:
+                    new_thread_id = await create_thread(parent_channel_id, thread_name)
         except Exception as exc:
             logger.debug(
                 "Child session: create thread failed on %s/%s: %s",
@@ -4934,6 +4952,13 @@ class GatewayRunner:
 
         if parent_source.platform == Platform.DISCORD and not new_thread_id:
             raise RuntimeError("failed to create Discord child session thread")
+
+        if announcement_channel_id:
+            metadata.setdefault("announcement_channel_id", str(announcement_channel_id))
+        if announcement_message_id:
+            metadata.setdefault("announcement_message_id", str(announcement_message_id))
+        if announcement_url:
+            metadata.setdefault("announcement_url", str(announcement_url))
 
         child_channel_id = str(new_thread_id or parent_channel_id)
         child_thread_id = str(new_thread_id) if new_thread_id else None
@@ -4987,6 +5012,9 @@ class GatewayRunner:
             session_id=session_id,
             dispatched=True,
             idempotent_replay=False,
+            announcement_channel_id=str(announcement_channel_id) if announcement_channel_id else None,
+            announcement_message_id=str(announcement_message_id) if announcement_message_id else None,
+            announcement_url=str(announcement_url) if announcement_url else None,
             metadata=metadata,
         )
 
