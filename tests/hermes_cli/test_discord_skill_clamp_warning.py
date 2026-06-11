@@ -244,3 +244,50 @@ def test_long_skill_name_preserves_cmd_key_through_by_category(
     short_entry = [e for e in entries if e[2] == "/short-skill"]
     assert len(short_entry) == 1
     assert short_entry[0][0] == "short-skill"
+
+
+def test_symlinked_local_skill_is_visible_to_discord_skill_autocomplete(
+    tmp_path: Path,
+) -> None:
+    """A skill symlinked into SKILLS_DIR must not be dropped after resolve().
+
+    ``scan_skill_commands`` records the lexical path under ``SKILLS_DIR``
+    (e.g. ``~/.hermes/skills/codebase-review/SKILL.md``). The Discord
+    collector used to resolve that path before checking scan-root membership,
+    so a symlink to a checkout outside ``SKILLS_DIR`` looked external and was
+    skipped. The handler then returned "Unknown skill" for a skill visible in
+    ``hermes skills list``.
+    """
+    from hermes_cli.commands import discord_skill_commands_by_category
+
+    skills_dir = tmp_path / "skills"
+    checkout_dir = tmp_path / "checkout" / "skills" / "codebase-review"
+    checkout_dir.mkdir(parents=True)
+    (checkout_dir / "SKILL.md").write_text(
+        "---\nname: codebase-review\ndescription: Review codebases\n---\n",
+        encoding="utf-8",
+    )
+    skills_dir.mkdir()
+    symlink_dir = skills_dir / "codebase-review"
+    symlink_dir.symlink_to(checkout_dir, target_is_directory=True)
+
+    fake_cmds = {
+        "/codebase-review": {
+            "name": "codebase-review",
+            "description": "Review codebases",
+            "skill_md_path": str(symlink_dir / "SKILL.md"),
+            "skill_dir": str(symlink_dir),
+        },
+    }
+
+    with patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds), \
+         patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+        categories, uncategorized, hidden = discord_skill_commands_by_category(
+            reserved_names=set(),
+        )
+
+    assert hidden == 0
+    assert uncategorized == [
+        ("codebase-review", "Review codebases", "/codebase-review")
+    ]
+    assert categories == {}

@@ -903,14 +903,21 @@ def discord_skill_commands_by_category(
 
         _skills_dir = SKILLS_DIR.resolve()
         _hub_dir = (SKILLS_DIR / ".hub").resolve()
-        # Build list of (resolved_root, is_local) tuples. Each external dir
-        # becomes its own scan root for category derivation — a skill at
+        # Build list of (lexical_root, resolved_root) tuples. Each external
+        # dir becomes its own scan root for category derivation — a skill at
         # ``<external>/mlops/foo/SKILL.md`` is still categorized as "mlops".
-        _scan_roots: list[_P] = [_skills_dir]
+        #
+        # Check lexical paths before resolved paths so skills symlinked into
+        # ~/.hermes/skills remain visible in Discord. Resolving the skill path
+        # first turns ~/.hermes/skills/foo/SKILL.md into the checkout path
+        # outside SKILLS_DIR, which made /skill report "Unknown skill" even
+        # though `hermes skills list` and direct skill_view could see it.
+        _scan_roots: list[tuple[_P, _P]] = [(SKILLS_DIR, _skills_dir)]
         try:
             for ext in get_external_skills_dirs():
                 try:
-                    _scan_roots.append(_P(ext).resolve())
+                    ext_path = _P(ext)
+                    _scan_roots.append((ext_path, ext_path.resolve()))
                 except Exception:
                     continue
         except Exception:
@@ -922,22 +929,33 @@ def discord_skill_commands_by_category(
             skill_path = info.get("skill_md_path", "")
             if not skill_path:
                 continue
-            sp = _P(skill_path).resolve()
+            raw_sp = _P(skill_path)
+            sp = raw_sp.resolve()
             # Hub skills are loaded via the skill hub, not surfaced as
             # slash commands.
             if str(sp).startswith(str(_hub_dir)):
                 continue
             # Accept skill if it lives under any scan root; record the
-            # matching root so we can derive the category correctly.
+            # matching root/path pair so we can derive the category correctly.
             matched_root: _P | None = None
-            for root in _scan_roots:
+            matched_path: _P | None = None
+            for lexical_root, resolved_root in _scan_roots:
                 try:
-                    sp.relative_to(root)
+                    raw_sp.relative_to(lexical_root)
+                except ValueError:
+                    pass
+                else:
+                    matched_root = lexical_root
+                    matched_path = raw_sp
+                    break
+                try:
+                    sp.relative_to(resolved_root)
                 except ValueError:
                     continue
-                matched_root = root
+                matched_root = resolved_root
+                matched_path = sp
                 break
-            if matched_root is None:
+            if matched_root is None or matched_path is None:
                 continue
 
             skill_name = info.get("name", "")
@@ -988,7 +1006,7 @@ def discord_skill_commands_by_category(
 
             # Determine category from the relative path within the matched
             # scan root. e.g. creative/ascii-art/SKILL.md → ("creative", ...)
-            rel = sp.parent.relative_to(matched_root)
+            rel = matched_path.parent.relative_to(matched_root)
             parts = rel.parts
             if len(parts) >= 2:
                 cat = parts[0]
