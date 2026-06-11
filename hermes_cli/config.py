@@ -804,6 +804,15 @@ DEFAULT_CONFIG = {
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
+    "codex_usage_alerts": {
+        # Passive post-delivery OpenAI Codex account usage alerts.
+        # When enabled, the gateway schedules a non-LLM background check after
+        # assistant responses are delivered and alerts once per usage window
+        # reset when Session/Weekly usage crosses threshold_percent.
+        "enabled": False,
+        "threshold_percent": 80,
+        "min_check_interval_seconds": 120,
+    },
     "toolsets": ["hermes-cli"],
     "agent": {
         "max_turns": 90,

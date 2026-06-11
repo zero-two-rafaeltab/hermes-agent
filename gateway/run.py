@@ -1891,6 +1891,7 @@ class GatewayRunner:
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
+        self._codex_usage_alerts = self._load_codex_usage_alerts_config()
 
         # Wire process registry into session store for reset protection
         from tools.process_registry import process_registry
@@ -3198,6 +3199,30 @@ class GatewayRunner:
             self._session_reasoning_overrides.pop(session_key, None)
         else:
             self._session_reasoning_overrides[session_key] = dict(reasoning_config)
+
+    @staticmethod
+    def _load_codex_usage_alerts_config() -> Dict[str, Any]:
+        """Load passive OpenAI Codex usage alert settings."""
+        cfg = _load_gateway_runtime_config()
+        block = cfg.get("codex_usage_alerts") if isinstance(cfg, dict) else None
+        if not isinstance(block, dict):
+            block = {}
+        enabled = is_truthy_value(block.get("enabled"), default=False)
+        try:
+            threshold_percent = float(block.get("threshold_percent", 80) or 80)
+        except (TypeError, ValueError):
+            threshold_percent = 80.0
+        threshold_percent = min(100.0, max(0.0, threshold_percent))
+        try:
+            min_interval_seconds = float(block.get("min_check_interval_seconds", 120) or 120)
+        except (TypeError, ValueError):
+            min_interval_seconds = 120.0
+        min_interval_seconds = max(0.0, min_interval_seconds)
+        return {
+            "enabled": enabled,
+            "threshold_percent": threshold_percent,
+            "min_check_interval_seconds": min_interval_seconds,
+        }
 
     @staticmethod
     def _load_service_tier() -> str | None:
@@ -8809,6 +8834,13 @@ class GatewayRunner:
                 # on error. Let the user drive the next turn.
                 if _final_text.strip():
                     try:
+                        self._register_codex_usage_alert_after_delivery(
+                            source,
+                            generation=_run_generation,
+                        )
+                    except Exception as _usage_alert_exc:
+                        logger.debug("Codex usage alert hook failed: %s", _usage_alert_exc)
+                    try:
                         session_entry = self.session_store.get_or_create_session(source)
                     except Exception:
                         session_entry = None
@@ -12027,6 +12059,90 @@ class GatewayRunner:
                 "goal continuation: status send failed: %s",
                 getattr(result, "error", "unknown error"),
             )
+
+    def _register_codex_usage_alert_after_delivery(
+        self,
+        source: Any,
+        *,
+        generation: Optional[int] = None,
+    ) -> None:
+        """Register a passive post-delivery Codex usage check.
+
+        The post-delivery callback only schedules a background task and returns;
+        the actual Codex usage API request happens after the user's response has
+        already been sent and never re-enters the agent/LLM loop.
+        """
+        cfg = getattr(self, "_codex_usage_alerts", None) or {}
+        if not cfg.get("enabled"):
+            return
+        if source is None or getattr(source, "platform", None) is None:
+            return
+        adapter = self.adapters.get(source.platform)
+        if not adapter or not hasattr(adapter, "register_post_delivery_callback"):
+            return
+        try:
+            session_key = self._session_key_for_source(source)
+        except Exception:
+            session_key = None
+        if not session_key:
+            return
+
+        def _after_delivery() -> None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            task = loop.create_task(self._run_codex_usage_alert_check(source))
+
+            def _log_task_failure(done: asyncio.Task) -> None:
+                if done.cancelled():
+                    return
+                try:
+                    exc = done.exception()
+                except Exception:
+                    return
+                if exc is not None:
+                    logger.debug("Codex usage alert background check failed: %s", exc, exc_info=True)
+
+            try:
+                task.add_done_callback(_log_task_failure)
+            except Exception:
+                pass
+
+        try:
+            adapter.register_post_delivery_callback(
+                session_key,
+                _after_delivery,
+                generation=generation,
+            )
+        except Exception as exc:
+            logger.debug("Codex usage alert: post-delivery registration failed: %s", exc)
+
+    async def _run_codex_usage_alert_check(self, source: Any) -> None:
+        cfg = getattr(self, "_codex_usage_alerts", None) or {}
+        if not cfg.get("enabled"):
+            return
+        try:
+            from agent.codex_usage_alerts import fetch_evaluate_and_render
+
+            message = await asyncio.to_thread(
+                fetch_evaluate_and_render,
+                threshold_percent=float(cfg.get("threshold_percent", 80.0)),
+                min_interval_seconds=float(cfg.get("min_check_interval_seconds", 120.0)),
+            )
+        except Exception as exc:
+            logger.debug("Codex usage alert: check failed: %s", exc, exc_info=True)
+            return
+        if not message:
+            return
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return
+        try:
+            metadata = self._thread_metadata_for_source(source)
+            await adapter.send(source.chat_id, message, metadata=metadata)
+        except Exception as exc:
+            logger.debug("Codex usage alert: send failed: %s", exc, exc_info=True)
 
     async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
         """Send a /goal status line after the main response is delivered.
